@@ -1,0 +1,295 @@
+import os
+import io
+import random
+import numpy as np
+import torch
+import random
+import h5py
+from typing import Dict, List, Union
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import Linear
+from Dynamic-attention-network.dgat_model import DGAT
+from torch_geometric.loader import DataLoader
+from torcheeg import transforms
+from torcheeg.datasets import SEEDDataset
+from torcheeg.model_selection import train_test_split_per_subject_groupby_trial
+from torcheeg.model_selection import train_test_split_groupby_trial
+import matplotlib
+import matplotlib.pyplot as plt
+import mne
+import seaborn as sns
+import PIL
+from matplotlib import colors
+from mne.viz import circular_layout
+from mne_connectivity.viz import plot_connectivity_circle
+from torcheeg.datasets.constants.emotion_recognition.seed import SEED_CHANNEL_LIST
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def return_same_index(a, b, num):  # a,b为长度相同的列表
+    count = []
+    for i in range(len(a)):
+        if a[i] == b[i] == num:
+            count.append(i)
+    return count
+
+def plot2image(ploter):
+        buf = io.BytesIO()
+        ploter.savefig(buf, bbox_inches='tight', pad_inches=0.0)
+        buf.seek(0)
+        return PIL.Image.open(buf)
+
+def plot2image(ploter):
+        buf = io.BytesIO()
+        ploter.savefig(buf, bbox_inches='tight', pad_inches=0.0)
+        buf.seek(0)
+        return PIL.Image.open(buf)
+
+# adjacency matrix connectivity carves
+def plot_adj_connectivity(adj: torch.Tensor,
+                          channel_list: list = None,
+                          region_list: list = None,
+                          num_connectivity: int = 120,
+                          linewidth: float = 1.5):
+    if channel_list is None:
+        channel_list = list(range(len(adj)))
+    # adj = adj.detach().cpu().numpy()
+    assert len(channel_list) == adj.shape[0] and len(channel_list) == adj.shape[
+        1], 'The size of the adjacency matrix does not match the number of channel names.'
+
+    node_colors = None
+    if region_list:
+        num_region = len(region_list)
+        colormap = matplotlib.cm.get_cmap('rainbow')
+        region_colors = list(colormap(np.linspace(0, 1, num_region)))
+
+        new_channel_list = []
+        new_adj_order = []
+        for region_index, region in enumerate(region_list):
+            for electrode_index in region:
+                new_adj_order.append(electrode_index)
+                new_channel_list.append(channel_list[electrode_index])
+        new_adj = adj[new_adj_order][:, new_adj_order]
+
+        electrode_colors = [None] * len(new_channel_list)
+        i = 0
+        for region_index, region in enumerate(region_list):
+            for electrode_index in region:
+                electrode_colors[i] = region_colors[region_index]
+                i += 1
+
+        adj = new_adj
+        channel_list = new_channel_list
+        node_colors = electrode_colors
+
+    node_angles = circular_layout(channel_list,
+                                  channel_list,
+                                  start_pos=90)
+    # Plot the graph using node colors from the FreeSurfer parcellation. We only
+    # show the 300 strongest connections.
+    fig, ax = plt.subplots(figsize=(8, 8),
+                            facecolor='white',
+                            subplot_kw=dict(polar=True))
+    plot_connectivity_circle(adj,
+                              channel_list,
+                              node_colors=node_colors,
+                              n_lines=num_connectivity,
+                              node_angles=node_angles,
+                              ax=ax,
+                              facecolor='white',
+                              textcolor='black',
+                              node_edgecolor='white',
+                              colormap='autumn',
+                              colorbar=False,
+                              padding=0.0,
+                              linewidth=linewidth,
+                              fontsize_names=16)
+    fig.tight_layout()
+    img = plot2image(fig)
+    plt.show()
+
+    return np.array(img)
+
+
+
+
+
+if __name__ == "__main__":
+    seed_everything(42)
+
+    os.makedirs("./tmp_out/examples_torch_geometric", exist_ok=True)
+    PATH = "D:\p_data\pyText\seed\studied_models\model_deta_allsub.pt"
+
+    dataset = SEEDDataset(io_path=f'D:\EEG_data\SEED_data\seed_beta',# f'D:\EEG_data\SEED_data\seed_3'
+                          root_path='D:\EEG_data\SEED_data\SEED\Preprocessed_EEG',
+                          offline_transform=transforms.BandDifferentialEntropy(
+                              band_dict={
+                                   "delta": [1, 4],
+                                   "theta": [4, 8],
+                                   "alpha": [8, 14],
+                                   "beta": [14, 31],
+                                   "gamma": [31, 51]
+                              }),
+                          online_transform=transforms.ToTensor(),
+                          label_transform=transforms.Compose([
+                              transforms.Select('emotion'),
+                              transforms.Lambda(lambda x: int(float(x)) + 1 if -2 < x < 2 else x == int(0)),
+                          ]),
+                          num_worker=8,
+                          cache_size=8 * 1024 * 1024 * 1024)
+    # train_dataset, val_dataset = train_test_split_per_subject_groupby_trial(dataset,subject=6,
+    #                                                              split_path=f'D:\p_data\pyText\seed\split_sub6')
+    train_dataset, val_dataset = train_test_split_groupby_trial(dataset, split_path=f'D:\p_data\pyText\seed\split_allsub')
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    loss_fn = nn.CrossEntropyLoss()
+    batch_size = 64
+    model = DGAT(require_att=True).to(device)
+    model.load_state_dict(torch.load(PATH))
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    size = len(val_loader.dataset)
+    num_batches = len(val_loader)
+    model.eval()
+    val_loss, correct = 0, 0
+
+    positive = {}
+    neutral = {}
+    negative = {}
+    with torch.no_grad():
+        count = 0
+        for batch in val_loader:
+            #             model = DGAT(require_att=True).to(device)
+            #             model.load_state_dict(torch.load(PATH))
+            X = batch[0].to(device)
+            y = batch[1].to(device)  # y[64,1]
+            pred, A = model(X)  # A[64,62,62,3], pred[64,3]
+            pos = return_same_index(pred.argmax(1), y, 0)
+            neu = return_same_index(pred.argmax(1), y, 1)
+            neg = return_same_index(pred.argmax(1), y, 2)
+            pos_g = torch.clone(A[pos])
+            neu_g = torch.clone(A[neu])
+            neg_g = torch.clone(A[neg])
+            if count == 0:
+                pos_graph = pos_g
+                neu_graph = neu_g
+                neg_graph = neg_g
+            else:
+                pos_graph = torch.cat([pos_graph, pos_g], dim=0)
+                neu_graph = torch.cat([neu_g, neu_graph], dim=0)
+                neg_graph = torch.cat([neg_g, neg_graph], dim=0)
+                print(pos_graph.shape, neu_graph.shape, neg_graph.shape)
+            count += 1
+            val_loss += loss_fn(pred, y).item()
+            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
+        val_loss /= num_batches
+    correct /= size
+    print(f"Test Error: \n Accuracy: {(100 * correct):>0.1f}%, Avg loss: {val_loss:>8f} \n")
+
+    # Obtain channel weight connection diagrams
+    pos_1 = torch.mean(pos_graph, dim=3, keepdim=True)
+    neu_1 = torch.mean(neu_graph, dim=3, keepdim=True)
+    neg_1 = torch.mean(neg_graph, dim=3, keepdim=True)
+
+    # Obtain channel weight connection diagrams for each emotion
+    pos_last = torch.mean(pos_1, dim=0, keepdim=True).squeeze()
+    neu_last = torch.mean(neu_1, dim=0, keepdim=True).squeeze()
+    neg_last = torch.mean(neg_1, dim=0, keepdim=True).squeeze()
+
+    # plot Histogram for each emotion
+    x = np.arange(62)
+    x_label = ['FP1', 'FPZ', 'FP2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6',
+               'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5',
+               'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2',
+               'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7',
+               'PO5', 'PO3', 'POZ', 'PO4', 'PO6', 'PO8', 'CB1', 'O1', 'OZ', 'O2', 'CB2']
+    a = torch.sum(pos_last.cpu(), dim=1)
+    b = torch.sum(neu_last.cpu(),dim=1)
+    c = torch.sum(neg_last.cpu(),dim=1)
+    total_width, n = 0.8, 3
+    width = total_width/n
+    plt.xticks(x,x_label,fontsize=4,rotation=90)
+    plt.bar(x,a,width = width,label='positive')
+    plt.bar(x+width,b,width = width,label='neutral')
+    plt.bar(x+2*width,c,width = width,label='negative')
+    plt.legend()
+    plt.savefig(fname="./allsub.png",dpi=200)
+    plt.show()
+
+    # plot heatmap for each emotion
+    sns.set_theme()
+    ax1 = sns.heatmap(pos_last.cpu().numpy(),
+                      xticklabels=['FP1', 'FPZ', 'FP2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6',
+                                   'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5',
+                                   'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2',
+                                   'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7',
+                                   'PO5', 'PO3', 'POZ', 'PO4', 'PO6', 'PO8', 'CB1', 'O1', 'OZ', 'O2', 'CB2']
+                      , yticklabels=['FP1', 'FPZ', 'FP2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6',
+                                     'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5',
+                                     'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2',
+                                     'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7',
+                                     'PO5', 'PO3', 'POZ', 'PO4', 'PO6', 'PO8', 'CB1', 'O1', 'OZ', 'O2', 'CB2']
+                      )
+    ax1.tick_params(labelsize=5)
+    plt.show()
+    # %%
+    ax2 = sns.heatmap(neu_last.cpu().numpy(),
+                      xticklabels=['FP1', 'FPZ', 'FP2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6',
+                                   'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5',
+                                   'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2',
+                                   'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7',
+                                   'PO5', 'PO3', 'POZ', 'PO4', 'PO6', 'PO8', 'CB1', 'O1', 'OZ', 'O2', 'CB2']
+                      , yticklabels=['FP1', 'FPZ', 'FP2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6',
+                                     'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5',
+                                     'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2',
+                                     'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7',
+                                     'PO5', 'PO3', 'POZ', 'PO4', 'PO6', 'PO8', 'CB1', 'O1', 'OZ', 'O2', 'CB2']
+                      )
+    ax2.tick_params(labelsize=5)
+    plt.show()
+    # %%
+    ax3 = sns.heatmap(neg_last.cpu().numpy(),
+                      xticklabels=['FP1', 'FPZ', 'FP2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6',
+                                   'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5',
+                                   'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2',
+                                   'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7',
+                                   'PO5', 'PO3', 'POZ', 'PO4', 'PO6', 'PO8', 'CB1', 'O1', 'OZ', 'O2', 'CB2']
+                      , yticklabels=['FP1', 'FPZ', 'FP2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6',
+                                     'F8', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'T7', 'C5',
+                                     'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2',
+                                     'CP4', 'CP6', 'TP8', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'PO7',
+                                     'PO5', 'PO3', 'POZ', 'PO4', 'PO6', 'PO8', 'CB1', 'O1', 'OZ', 'O2', 'CB2']
+                      )
+    ax3.tick_params(labelsize=5)
+    plt.show()
+
+    # plot adjacency matrix connectivity carves
+    img = plot_adj_connectivity(pos_last.cpu().numpy(), SEED_CHANNEL_LIST)
+    plt.show()
+    # %%
+    img2 = plot_adj_connectivity(neu_last.cpu().numpy(), SEED_CHANNEL_LIST)
+    plt.show()
+    # %%
+    img3 = plot_adj_connectivity(neg_last.cpu().numpy(), SEED_CHANNEL_LIST)
+    plt.show()
+
+    # Save the learned adjacency matrix
+    f = h5py.File('D:\p_data\pyText\\graph_beta_allsub.h5', 'w')
+    f.create_dataset('a', data=a)
+    f.create_dataset('b', data=b)
+    f.create_dataset('c', data=c)
+    f.create_dataset('all', data=ele)
+    f.close()
+
+
+
