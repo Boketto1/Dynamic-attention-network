@@ -1,0 +1,152 @@
+import os
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from Eeg.Dynamic_Gnn.dgat_3 import DGAT
+from torch_geometric.loader import DataLoader
+from torcheeg import transforms
+from torcheeg.datasets import SEEDDataset
+from torcheeg.model_selection import train_test_split_groupby_trial
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train(dataloader, model, loss_fn, optimizer):
+    size = len(dataloader.dataset)
+    train_acc = 0.0
+    train_los = 0.0
+    model.train()
+    for batch_idx, batch in enumerate(dataloader):
+        X = batch[0].to(device)
+        y = batch[1].to(device)
+
+        # Compute prediction error
+        pred = model(X)
+        loss = loss_fn(pred, y)
+        train_los += loss
+
+        train_acc += (pred.argmax(1) == y).type(torch.float).sum().item()
+        # Backpropagation
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+
+        if batch_idx % 500 == 0:
+            loss, current = loss.item(), batch_idx * batch_size
+            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+    train_losses.append(train_los / size)
+    train_acces.append(train_acc / size)
+
+
+def valid(dataloader, model, loss_fn):
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)
+    model.eval()
+    val_loss, correct = 0, 0
+    with torch.no_grad():
+        for batch in dataloader:
+            X = batch[0].to(device)
+            y = batch[1].to(device)
+
+            pred = model(X)
+            val_loss += loss_fn(pred, y).item()
+            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
+    val_loss /= num_batches
+    correct /= size
+    eval_losses.append(val_loss)
+    eval_acces.append(correct)
+    # 保存模型
+    PATH = "D:\p_data\pyText\seed\studied_models\model_delta_allsub.pt"
+    count_1 = 0
+    if (correct>=0.49) & (count_1==0):
+        torch.save(model.state_dict(), PATH)
+        count_1+=1
+
+    print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {val_loss:>8f} \n")
+
+
+if __name__ == "__main__":
+    seed_everything(42)
+
+    train_losses = []
+    train_acces = []
+    eval_losses = []
+    eval_acces = []
+
+    os.makedirs("./tmp_out/examples_torch_geometric", exist_ok=True)
+
+    dataset = SEEDDataset(io_path=f'D:\EEG_data\SEED_data\seed_delta',
+                          root_path='D:\EEG_data\SEED_data\SEED\Preprocessed_EEG',
+                          offline_transform=transforms.BandDifferentialEntropy(
+                              band_dict={
+                                 "delta":[1,4],
+                                # "theta":[4,8],
+                                # "alpha":[8,14],
+                                # "beta":[14,31],
+                                # "gamma":[31,51]
+                          }),
+                          online_transform=transforms.ToTensor(),
+                          label_transform=transforms.Compose([
+                              transforms.Select('emotion'),
+                              transforms.Lambda(lambda x : int(float(x))+1 if -2<x<2 else x ==int(0)),
+                          ]),
+                          num_worker=8,
+                          cache_size=8*1024*1024*1024)
+
+    train_dataset, val_dataset = train_test_split_groupby_trial(dataset,split_path=f'D:\p_data\pyText\seed\split_allsub')
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    loss_fn = nn.CrossEntropyLoss()
+    batch_size = 64
+
+
+    model = DGAT().to(device)
+    # model.load_state_dict(torch.load(PATH))
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    epochs = 60
+    for t in range(epochs):
+        print(f"Epoch {t+1}\n-------------------------------")
+        train(train_loader, model, loss_fn, optimizer)
+        valid(val_loader, model, loss_fn)
+
+    print("Done!")
+    # plot training and validation loss curves
+    train_acces = torch.tensor(train_acces,device='cpu').numpy()
+    train_losses = torch.tensor(train_losses,device='cpu').numpy()
+    eval_acces = torch.tensor(eval_acces,device='cpu').numpy()
+    eval_losses = torch.tensor(eval_losses,device='cpu').numpy()
+
+
+    plt.plot(np.arange(len(train_losses)), train_losses, label="train loss")
+
+    plt.plot(np.arange(len(train_acces)), train_acces, label="train acc")
+
+    plt.plot(np.arange(len(eval_losses)), eval_losses, label="valid loss")
+
+    plt.plot(np.arange(len(eval_acces)), eval_acces, label="valid acc")
+    plt.legend() 
+    plt.xlabel('epoches')
+    # plt.ylabel("epoch")
+    plt.show()
+
+
+    # save trained models
+    PATH = "D:\p_data\pyText\seed\studied_models\model_delta_allsub.pt"
+    torch.save(model.state_dict(),PATH)
+    # print model summary
+    for param_tensor in model.state_dict():  
+        print(param_tensor, '\t', model.state_dict()[param_tensor].size())
