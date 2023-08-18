@@ -1,0 +1,144 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class GraphAttentionLayer(nn.Module):
+
+    def __init__(self, in_features: int, out_features: int, n_heads: int,
+                 alpha: float = 0.2,
+                 concat: bool = True,
+                 dropout: float = 0.3,
+                 require_attention: bool = False,
+                 share_weights: bool = False):
+
+        super(GraphAttentionLayer, self).__init__()
+
+        self.n_heads = n_heads
+        self.alpha = alpha
+        self.concat = concat
+        self.require_attention = require_attention
+        if concat:
+            assert out_features % n_heads == 0
+            self.n_hidden = out_features // n_heads
+        else:
+            self.n_hidden = out_features
+
+        self.linear_l = nn.Linear(in_features, self.n_hidden * n_heads, bias=False)
+
+        if share_weights:
+            self.linear_r = self.linear_l
+        else:
+            self.linear_r = nn.Linear(in_features, self.n_hidden * n_heads, bias=False)
+
+        self.attn = nn.Linear(self.n_hidden, 1, bias=False)
+
+        self.activation = nn.LeakyReLU(negative_slope=self.alpha)
+        self.softmax = nn.Softmax(dim=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, h: torch.Tensor):  # h(bs, 62, 5) # 假设out_features = 2*32= n_heads * n_hidden
+        n_nodes = h.shape[1]  # n_nodes = 62
+
+        g_l = self.linear_l(h).view(-1, n_nodes, self.n_heads, self.n_hidden)  # g_l(bs, 62,2,32)
+        g_r = self.linear_r(h).view(-1, n_nodes, self.n_heads, self.n_hidden)  # g_r(bs, 62,2,32)
+
+        g_l_repeat = g_l.repeat(1, n_nodes, 1, 1)  # g_l_repeat (bs, 62*62,2,32)
+        g_r_repeat_interleave = g_r.repeat_interleave(n_nodes, dim=1)  # g_r_repaet_interleave (62*62, 2, 32)
+
+        g_sum = g_l_repeat + g_r_repeat_interleave  # g_sum (bs, 62*62, 2, 32)
+        g_sum = g_sum.view(-1, n_nodes, n_nodes, self.n_heads, self.n_hidden)  # g_sum(bs, 62,62,2,32)
+
+        # 整合公式，GATv1和GATv2的区别就在这
+        e = self.activation(self.attn(g_sum))  # e (bs, 62,62,2,1)
+        # e = self.attn(self.activation(g_sum))
+
+        e = e.squeeze(-1)  # e(bs, 62,62,2)
+
+        #         assert adj_mat.shape[0] == 1 or adj_mat.shape[0] == n_nodes
+        #         assert adj_mat.shape[1] == 1 or adj_mat.shape[1] == n_nodes
+        #         assert adj_mat.shape[2] == 1 or adj_mat.shape[2] == self.n_heads
+
+        # 关键一步：邻接矩阵到底是否要添加
+        # e = e.masked_fill(adj_mat == 0,float('-inf'))
+
+        a = self.softmax(e)
+
+        a_d = self.dropout(a)  # a(bs, 62,62,2)
+
+        attn_res = torch.einsum('bijh,bjhf->bihf', a_d, g_r)  # attn_res(bs,62,2,32)
+
+        if self.require_attention & self.concat:
+            return  attn_res.reshape(-1, n_nodes, self.n_heads * self.n_hidden),a
+        elif self.concat:
+            return attn_res.reshape(-1, n_nodes, self.n_heads * self.n_hidden)  # (62,64)
+        else:
+            return attn_res.mean(dim=2)
+
+
+class DGAT(nn.Module):
+    def __init__(self,
+                 num_electrodes: int = 62,
+                 num_layers: int = 1,
+                 num_heads: int = 3,
+                 in_channels: int = 1,
+                 hid_channels: int = 96,
+                 num_classes: int = 3,
+                 require_att: bool = False):
+        super(DGAT, self).__init__()
+        self.num_electrodes = num_electrodes
+        self.num_layers = num_layers
+        self.in_channels = in_channels
+        self.hid_channels = hid_channels
+        self.num_classes = num_classes
+        self.num_heads = num_heads
+        self.require_att = require_att
+
+        self.gats = nn.ModuleList()
+        if self.require_att:
+            for i in range(num_layers):
+                if i == 0:
+                    self.gats.append(GraphAttentionLayer(in_channels, hid_channels, num_heads,require_attention=require_att))
+                elif i == (num_layers-1):
+                    self.gats.append(GraphAttentionLayer(hid_channels, hid_channels, num_heads,require_attention=require_att))
+                else:
+                    self.gats.append(GraphAttentionLayer(hid_channels, hid_channels, num_heads))
+        else:
+            for i in range(num_layers):
+                if i == 0:
+                    self.gats.append(GraphAttentionLayer(in_channels, hid_channels, num_heads))
+                else:
+                    self.gats.append(GraphAttentionLayer(hid_channels, hid_channels, num_heads))
+        self.BN1 = nn.BatchNorm1d(in_channels)
+        self.dense = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(num_electrodes * hid_channels, 1024),
+            nn.Linear(1024,64),
+            nn.Linear(64, num_classes))
+
+        # 不确定要不要这个
+
+    #         self.A = nn.Parameter(torch.FloatTensor(num_electrodes,num_electrodes))
+    #         nn.init.xavier_normal_(self.A)
+
+    def forward(self, x: torch.Tensor):
+        x = self.BN1(x.transpose(1, 2)).transpose(1, 2)
+        # L = normalize_A(self.A)
+        if self.require_att:
+            for i in range(len(self.gats)):
+                if i == 0:
+                    x,A = self.gats[i](x)
+                elif i ==len(self.gats)-1:
+                    x,A = self.gats[i](x)
+                else:
+                    x = self.gats[i](x)
+            x = self.dense(x)
+            return  x,A
+        else:
+            for i in range(len(self.gats)):
+                if i == 0:
+                    x = self.gats[i](x)
+                else:
+                    x = self.gats[i](x)
+            x = self.dense(x)
+            return x
