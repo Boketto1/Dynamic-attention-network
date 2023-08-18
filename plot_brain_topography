@@ -1,0 +1,49 @@
+import mne
+import pandas as pd
+import numpy as np
+import h5py
+from torcheeg.datasets.constants.emotion_recognition.seed import SEED_CHANNEL_LIST
+
+# Read biosemi electrode position information in MNE
+biosemi_montage = mne.channels.make_standard_montage('biosemi64')
+print(biosemi_montage.get_positions())
+sensor_data = biosemi_montage.get_positions()['ch_pos']
+print(sensor_data)
+sensor_dataframe = pd.DataFrame(sensor_data).T
+sensor_dataframe.to_excel('sensor_dataframe.xlsx')
+
+# Modify and supplement the obtained electrode position information with missing electrode positions, and integrate them into 1020.xlsx
+data1020 = pd.read_excel('D:\p_data\pyText\\1020.xlsx', index_col=0)
+channels1020 = np.array(data1020.index)
+value1020 = np.array(data1020)
+
+# Store the electrode channel name and corresponding 3D coordinate position in dictionary form
+list_dic = dict(zip(channels1020, value1020))
+print(list_dic)
+
+montage_1020 = mne.channels.make_dig_montage(ch_pos=list_dic,
+                                             nasion=[5.27205792e-18, 8.60992398e-02, -3.01487349e-02],
+                                             lpa=[-0.08609924, -0., -0.04014873],
+                                             rpa=[0.08609924, 0., -0.04014873])
+
+# plot electrode position
+montage_1020.plot()
+
+data1020 = pd.read_excel('D:\p_data\pyText\\1020.xlsx', index_col=0)
+
+# afferent the adjacency matrix from retrun_graph_and_adjacency_matrix 
+with h5py.File('D:\p_data\pyText\\graph_beta_allsub.h5', 'r') as f:
+        positive = np.array(f['a'])
+        neutral = np.array(f['b'])
+        negative = np.array(f['c'])
+        all = np.array(f['all'])
+        f.close()
+positive = np.expand_dims(np.squeeze(positive),axis=1)
+neutral = np.expand_dims(np.squeeze(neutral),axis=1)
+negative = np.expand_dims(np.squeeze(negative),axis=1)
+info = mne.create_info(ch_names=SEED_CHANNEL_LIST, sfreq=250.,
+                            ch_types='eeg')                     
+evoked = mne.EvokedArray(positive/1000000, info)
+evoked.set_montage(montage_1020)
+# plot and save brain topography
+evoked.plot_topomap(units=' ',cbar_fmt='%d',res=400).savefig(fname="./positive.png",dpi=300)
